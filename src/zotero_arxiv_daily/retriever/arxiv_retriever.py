@@ -19,6 +19,17 @@ T = TypeVar("T")
 DOWNLOAD_TIMEOUT = (10, 60)
 PDF_EXTRACT_TIMEOUT = 180
 TAR_EXTRACT_TIMEOUT = 180
+RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504}
+MAX_BATCH_ATTEMPTS = 5
+MAX_CONSECUTIVE_FAILED_BATCHES = 3
+
+
+def _is_retryable_api_error(exc: Exception) -> bool:
+    return (
+        isinstance(exc, arxiv.HTTPError) and exc.status in RETRYABLE_HTTP_STATUSES
+    ) or isinstance(exc, (
+        arxiv.UnexpectedEmptyPageError, requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+    ))
 
 
 def _download_file(url: str, path: str) -> None:
@@ -114,7 +125,8 @@ class ArxivRetriever(BaseRetriever):
             raise ValueError("category must be specified for arxiv.")
 
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
-        client = arxiv.Client(num_retries=10, delay_seconds=10)
+        # Retry here so the library does not multiply each batch retry by 11.
+        client = arxiv.Client(num_retries=0, delay_seconds=10)
         query = '+'.join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
         # Get the latest paper from arxiv rss feed
@@ -132,27 +144,53 @@ class ArxivRetriever(BaseRetriever):
             all_paper_ids = all_paper_ids[:10]
 
         # Get full information of each paper from arxiv api
-        bar = tqdm(total=len(all_paper_ids))
-        max_batch_retries = 5
-        batch_retry_delay = 30
-        for i in range(0, len(all_paper_ids), 20):
-            search = arxiv.Search(id_list=all_paper_ids[i:i + 20])
-            for attempt in range(max_batch_retries):
-                try:
-                    batch = list(client.results(search))
-                    bar.update(len(batch))
-                    raw_papers.extend(batch)
+        failed_batches = 0
+        consecutive_failures = 0
+        last_error = None
+        with tqdm(total=len(all_paper_ids)) as bar:
+            for i in range(0, len(all_paper_ids), 20):
+                search = arxiv.Search(id_list=all_paper_ids[i:i + 20])
+                for attempt in range(MAX_BATCH_ATTEMPTS):
+                    try:
+                        # Commit a batch only after its iterator finishes successfully.
+                        batch = list(client.results(search))
+                        raw_papers.extend(batch)
+                        bar.update(len(batch))
+                        consecutive_failures = 0
+                        break
+                    except (arxiv.HTTPError, arxiv.UnexpectedEmptyPageError, requests.exceptions.RequestException) as exc:
+                        if not _is_retryable_api_error(exc):
+                            raise
+                        last_error = exc
+                        if attempt < MAX_BATCH_ATTEMPTS - 1:
+                            wait = min(30 * 2 ** attempt, 120)
+                            logger.warning(
+                                f"arXiv API {type(exc).__name__} "
+                                f"(status={getattr(exc, 'status', None)}) on batch {i // 20 + 1}; "
+                                f"retry {attempt + 1}/{MAX_BATCH_ATTEMPTS - 1} in {wait}s"
+                            )
+                            sleep(wait)
+                        else:
+                            failed_batches += 1
+                            consecutive_failures += 1
+                            logger.warning(
+                                f"Skipping arXiv batch {i // 20 + 1} after {MAX_BATCH_ATTEMPTS} attempts; "
+                                f"keeping {len(raw_papers)} papers already retrieved: {exc}"
+                            )
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILED_BATCHES:
+                    logger.warning("Stopping arXiv requests after repeated batch failures")
                     break
-                except arxiv.HTTPError as exc:
-                    if exc.status == 429 and attempt < max_batch_retries - 1:
-                        wait = batch_retry_delay * (attempt + 1)
-                        logger.warning(f"arXiv API 429 on batch {i // 20}, retry {attempt + 1}/{max_batch_retries} in {wait}s")
-                        sleep(wait)
-                    else:
-                        raise
-            if i + 20 < len(all_paper_ids):
-                sleep(3)
-        bar.close()
+                if i + 20 < len(all_paper_ids):
+                    sleep(3)
+
+        if last_error is not None and not raw_papers:
+            # A service failure must not look like an ordinary day with no papers.
+            raise last_error
+        if failed_batches:
+            logger.warning(
+                f"arXiv retrieval is incomplete: {failed_batches} failed batches; "
+                f"continuing with {len(raw_papers)} papers"
+            )
 
         return raw_papers
 
